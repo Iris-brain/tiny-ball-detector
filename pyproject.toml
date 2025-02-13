@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "tiny-ball-detector"
+version = "0.1.0"
+description = ""
+authors = ["Gaétan Dubuc <gaet.dub1@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "tiny_ball_detector", from = "./src" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+tensorflow = "^2.18.0"
+matplotlib = "^3.10.0"
+pandas = "^2.2.3"
+opencv-python = "^4.11.0.86"
+tqdm = "^4.67.1"
+
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.5"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
