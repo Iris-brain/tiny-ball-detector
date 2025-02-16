@@ -1,158 +1,168 @@
 from dataclasses import dataclass, field
+from enum import Enum
 import functools
 from logging import Logger
+import os
 from pathlib import Path
-from typing import Any, Generator, Iterable, Tuple
+from typing import Any, Generator, Iterable, OrderedDict, Tuple
 import keras
+from matplotlib import pyplot as plt
 import numpy as np
 import tensorflow as tf
+from PIL import Image
+
+
+class ColorMode(Enum):
+    GRAYSCALE = "grayscale"
+    RGB = "rgb"
+    RGBA = "rgba"
 
 
 @dataclass
-class TrackNetDatasetLoader:
+class TrackNetDataset:
     path: Path
     n_frames: int
     logger: Logger
     training: bool = False
-    height = 1280
-    width = 720
-    dataset: tf.data.Dataset = field(init=False)
+    height = 720
+    width = 1280
     size: int = field(init=False)
     variance: int = field(init=False)
     gaussian_kernel: np.ndarray = field(init=False)
 
-    def __post_init__(self):
-        self.dataset = tf.data.Dataset.from_generator(
-            self.get_generator,
-            output_types=(
-                tf.float32,
-                {
-                    "file name": tf.string,
-                    "visibility": tf.int32,
-                    "x-coordinate": tf.int32,
-                    "y-coordinate": tf.int32,
-                    "status": tf.int32,
-                },
-            ),
-            output_shapes=(
-                (None, None, None, 3),
-                {
-                    "file name": (1,),
-                    "visibility": (1,),
-                    "x-coordinate": (1,),
-                    "y-coordinate": (1,),
-                    "status": (1,),
-                },
-            ),
+    def make_ground_truth_image(self, size: int = 20, variance: int = 10) -> None:
+        self.size = size
+        self.variance = variance
+        self.gaussian_kernel = create_gaussian_kernel(size, variance)
+
+        clip_path: str
+        for clip_path, label in self.get_label():
+            self.create_and_save_mask(label=label, clip_path=clip_path)
+
+    def create_and_save_mask(self, label, clip_path: str) -> None:
+        ball_is_visible = int(label["visibility"][0] != 0)
+        y_coord = label["y-coordinate"][0]
+        x_coord = label["x-coordinate"][0]
+
+        distance_y_coor_to_top = min(y_coord, self.size)
+        distance_y_coor_to_bottom = min(self.height - y_coord, self.size + 1)
+        distance_x_coor_to_left = min(x_coord, self.size)
+        distance_x_coor_to_right = min(self.width - x_coord, self.size + 1)
+
+        mask = np.zeros((self.height, self.width), dtype=np.uint8)
+
+        new_gaussian_kernel = (
+            ball_is_visible
+            * self.gaussian_kernel[
+                self.size
+                - distance_y_coor_to_top : self.size
+                + distance_y_coor_to_bottom,
+                self.size
+                - distance_x_coor_to_left : self.size
+                + distance_x_coor_to_right,
+            ]
         )
+
+        mask[
+            y_coord - distance_y_coor_to_top : y_coord + distance_y_coor_to_bottom,
+            x_coord - distance_x_coor_to_left : x_coord + distance_x_coor_to_right,
+        ] = new_gaussian_kernel
+
+        self.save_grayscale_mask(mask, label, clip_path)
+
+    def get_label(self) -> Generator[Tuple, Any, Any]:
+        pairs = self.get_clips_and_labels_paths()
+
+        for clip_path, label_path in pairs.items():
+            label_dataset = self.load_label_csv(label_path)
+            for label in label_dataset:
+                yield clip_path, label
 
     def get_clips_and_labels_paths(self) -> dict[str, str]:
         clip_and_labels_paths_map = {
-            str(p): str(p) + "/Label.csv" for p in list(self.path.glob("*/Clip*/"))
+            str(p): str(p) + "/Label.csv"
+            for p in sorted(list(self.path.glob("input/*/Clip*/")))
         }
         self.logger.error(f"📌 Number of clips found: {len(clip_and_labels_paths_map)}")
 
         return clip_and_labels_paths_map
 
-    def concatenate(
-        self, list_of_dataset: Iterable[tf.data.Dataset]
-    ) -> tf.data.Dataset:
-        return functools.reduce(
-            lambda prev_dataset, current_dataset: prev_dataset.concatenate(
-                current_dataset
-            ),
-            list_of_dataset,
-        )
-
-    def load_clip(self, clip_path: str) -> tf.data.Dataset:
-        dataset: tf.data.Dataset = keras.utils.image_dataset_from_directory(
-            directory=clip_path,
-            labels=None,  # type: ignore
-            label_mode=None,  # type: ignore
-            image_size=(self.width, self.height),
-            batch_size=None,  # type: ignore
-            shuffle=False,
-            pad_to_aspect_ratio=True,
-            verbose=False,
-        )
-        return dataset
-
-    def load_label(self, label_path: str):
+    def load_label_csv(self, label_path: str):
         dataset = tf.data.experimental.make_csv_dataset(
             label_path,
-            batch_size=1,  # Artificially small to make examples easier to show.
+            batch_size=1,
             num_epochs=1,
             ignore_errors=True,
             shuffle=False,
         )
 
-        return dataset.enumerate().filter(skip(self.n_frames)).map(lambda _, x: x)
+        return dataset
+
+    def save_grayscale_mask(self, mask: np.ndarray, label: OrderedDict, clip_path: str):
+        im = Image.fromarray(mask, mode="L")
+
+        file_name_str: str = label["file name"][0].numpy().decode("utf-8")
+        output_path = clip_path.replace("input", "output")
+        os.makedirs(output_path, exist_ok=True)
+
+        im.save(f"{output_path}/{file_name_str}")
+
+    @property
+    def dataset(self) -> tf.data.Dataset:
+        return tf.data.Dataset.from_generator(
+            self.__call__,
+            output_types=(
+                tf.float32,
+                tf.float32,
+            ),
+            output_shapes=(
+                (self.n_frames, self.height, self.width, 3),
+                (self.n_frames, self.height, self.width, 1),
+            ),
+        ).map(self.transpose_reshape)
+
+    def transpose_reshape(self, image, label):
+        image_transposed = tf.transpose(image, perm=[1, 2, 0, 3])
+        image_final = tf.reshape(image_transposed, (self.height, self.width, 9))
+        return image_final, label[[-1]]
+
+    def __call__(self) -> Generator[Any, Any, Any]:
+        pairs = self.get_clips_and_labels_paths()
+
+        for clip_path, _ in pairs.items():
+            clip_dataset = self.load_video_dataset(path=clip_path)
+            mask_dataset = self.load_video_dataset(
+                path=clip_path.replace("input", "output"),
+                color_mode=ColorMode.GRAYSCALE,
+            )
+            dataset = tf.data.Dataset.zip(clip_dataset, mask_dataset)
+            dataset = self.group_frames(dataset=dataset)
+
+            for input, mask in dataset:
+                yield input, mask
 
     def group_frames(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
         return dataset.batch(self.n_frames, drop_remainder=True)
 
-    def get_generator(self) -> Generator[Tuple, Any, Any]:
-        pairs = self.get_clips_and_labels_paths()
-
-        for clip_path, label_path in pairs.items():
-            clip_dataset = self.load_clip(clip_path=clip_path)
-            clip_dataset = self.group_frames(dataset=clip_dataset)
-            label_dataset = self.load_label(label_path)
-
-            dataset = tf.data.Dataset.zip(clip_dataset, label_dataset)
-
-            for sample in dataset:
-                yield sample
-
-    def __call__(self, size: int = 20, variance: int = 10) -> tf.data.Dataset:
-        self.size = size
-        self.variance = variance
-        self.kernel_radius = int(size // 2)
-        self.gaussian_kernel = create_gaussian_kernel(size, variance)
-        dataset = self.dataset.apply(self.transform_coordinates_to_mask)
+    def load_video_dataset(
+        self, path: str, color_mode: ColorMode = ColorMode.RGB
+    ) -> tf.data.Dataset:
+        dataset: tf.data.Dataset = keras.utils.image_dataset_from_directory(
+            directory=path,
+            labels=None,  # type: ignore
+            label_mode=None,  # type: ignore
+            image_size=(self.height, self.width),
+            batch_size=None,  # type: ignore
+            shuffle=False,
+            color_mode=color_mode.value,
+            pad_to_aspect_ratio=True,
+            verbose=False,
+        )
         return dataset
-
-    def transform_coordinates_to_mask(self, ds: tf.data.Dataset) -> tf.data.Dataset:
-        for i, j in ds.take(4):
-            distance_to_top = int(
-                self.kernel_radius - min(j["y-coordinate"][0], self.kernel_radius)
-            )
-            distance_to_bottom = int(
-                self.kernel_radius
-                - min(self.height - j["y-coordinate"][0], self.kernel_radius)
-            )
-            distance_to_left = int(
-                self.kernel_radius - min(j["x-coordinate"][0], self.kernel_radius)
-            )
-            distance_to_right = int(
-                self.kernel_radius
-                - min(self.width - j["x-coordinate"][0], self.kernel_radius)
-            )
-            print(
-                self.kernel_radius,
-                j["y-coordinate"],
-                j["x-coordinate"],
-                distance_to_top,
-                distance_to_bottom,
-                distance_to_left,
-                distance_to_right,
-                self.gaussian_kernel[
-                    distance_to_left : -(distance_to_right + 1),
-                    distance_to_top : -(distance_to_bottom + 1),
-                ],
-            )
-
-        return ds
-
-
-def skip(n_frames: int):
-    def _skip(i: int, _):
-        return tf.equal(i % n_frames, 2)
-
-    return _skip
 
 
 def gaussian_kernel(size: int, variance: int) -> np.ndarray:
+    assert size % 2 == 0, "size should be a pair number"
     x, y = np.mgrid[-size : size + 1, -size : size + 1]
     g = np.exp(-(x**2 + y**2) / float(2 * variance))
     return g
