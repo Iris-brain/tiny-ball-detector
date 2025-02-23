@@ -1,21 +1,30 @@
 from dataclasses import dataclass, field
-from enum import Enum
 import functools
 from logging import Logger
 import os
 from pathlib import Path
-from typing import Any, Generator, Iterable, OrderedDict, Tuple
-import keras
-from matplotlib import pyplot as plt
+from typing import Any, Generator, OrderedDict, Tuple
 import numpy as np
 import tensorflow as tf
 from PIL import Image
 
+from tiny_ball_detector.dataset.image_parser import ColorMode, ImageParser
 
-class ColorMode(Enum):
-    GRAYSCALE = "grayscale"
-    RGB = "rgb"
-    RGBA = "rgba"
+
+@dataclass(kw_only=True)
+class GameDataset:
+    game: str
+    clip: str
+    clip_path: Path
+
+    @property
+    def dataset(self) -> tf.data.Dataset:
+        return tf.data.Dataset.from_tensor_slices(
+            [
+                [str(path), str(path).replace("input", "output")]
+                for path in self.clip_path.glob("*.jpg")
+            ]
+        )
 
 
 @dataclass
@@ -109,56 +118,33 @@ class TrackNetDataset:
 
     @property
     def dataset(self) -> tf.data.Dataset:
-        return tf.data.Dataset.from_generator(
-            self.__call__,
-            output_types=(
-                tf.float32,
-                tf.float32,
-            ),
-            output_shapes=(
-                (self.n_frames, self.height, self.width, 3),
-                (self.n_frames, self.height, self.width, 1),
-            ),
-        ).map(self.transpose_reshape)
+        parser = ImageParser(image_size=(self.height, self.width))
+        data = [
+            GameDataset(
+                game=clip_path.parts[-2],
+                clip=clip_path.parts[-1],
+                clip_path=clip_path,
+            )
+            .dataset.map(
+                lambda x: (
+                    parser(x[0], color_mode=ColorMode.RGB),
+                    parser(x[1], color_mode=ColorMode.GRAYSCALE),
+                )
+            )
+            .batch(self.n_frames, drop_remainder=True)
+            .map(self.transpose_reshape)
+            for clip_path in sorted(list(self.path.glob("input/*/Clip*/")))
+        ]
+
+        return functools.reduce(lambda x, y: x.concatenate(y), data)
 
     def transpose_reshape(self, image, label):
         image_transposed = tf.transpose(image, perm=[1, 2, 0, 3])
         image_final = tf.reshape(image_transposed, (self.height, self.width, 9))
         return image_final, label[[-1]]
 
-    def __call__(self) -> Generator[Any, Any, Any]:
-        pairs = self.get_clips_and_labels_paths()
-
-        for clip_path, _ in pairs.items():
-            clip_dataset = self.load_video_dataset(path=clip_path)
-            mask_dataset = self.load_video_dataset(
-                path=clip_path.replace("input", "output"),
-                color_mode=ColorMode.GRAYSCALE,
-            )
-            dataset = tf.data.Dataset.zip(clip_dataset, mask_dataset)
-            dataset = self.group_frames(dataset=dataset)
-
-            for input, mask in dataset:
-                yield input, mask
-
     def group_frames(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
         return dataset.batch(self.n_frames, drop_remainder=True)
-
-    def load_video_dataset(
-        self, path: str, color_mode: ColorMode = ColorMode.RGB
-    ) -> tf.data.Dataset:
-        dataset: tf.data.Dataset = keras.utils.image_dataset_from_directory(
-            directory=path,
-            labels=None,  # type: ignore
-            label_mode=None,  # type: ignore
-            image_size=(self.height, self.width),
-            batch_size=None,  # type: ignore
-            shuffle=False,
-            color_mode=color_mode.value,
-            pad_to_aspect_ratio=True,
-            verbose=False,
-        )
-        return dataset
 
 
 def gaussian_kernel(size: int, variance: int) -> np.ndarray:
