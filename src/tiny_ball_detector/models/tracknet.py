@@ -20,6 +20,10 @@ class ConvBlock(layers.Layer):
             ]
         )
 
+    def build(self, input_shape):
+        self.block.build(input_shape)
+        super().build(input_shape)
+
     def call(self, x):
         return self.block(x)
 
@@ -53,6 +57,11 @@ class TrackerNet(keras.Model):
         self.conv18 = ConvBlock(out_channels=256)
 
         self.softmax = layers.Softmax()
+
+    def build(self, input_shape):
+        x = keras.Input(shape=input_shape[1:])
+        self.call(x)
+        super().build(input_shape)
 
     def call(self, x: tf.Tensor, training=False):
         x = self.conv1(x)
