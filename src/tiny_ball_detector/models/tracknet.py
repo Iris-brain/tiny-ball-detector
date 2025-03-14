@@ -1,31 +1,7 @@
 import tensorflow as tf
 import keras
 from keras import layers
-
-
-class ConvBlock(layers.Layer):
-    def __init__(self, out_channels, kernel_size=3, stride=1, use_bias=True):
-        super().__init__()
-        self.block = keras.Sequential(
-            [
-                layers.Conv2D(
-                    filters=out_channels,
-                    kernel_size=kernel_size,
-                    strides=stride,
-                    padding="same",
-                    use_bias=use_bias,
-                ),
-                layers.ReLU(),
-                layers.BatchNormalization(),
-            ]
-        )
-
-    def build(self, input_shape):
-        self.block.build(input_shape)
-        super().build(input_shape)
-
-    def call(self, x):
-        return self.block(x)
+from .conv_bloc import ConvBlock
 
 
 class TrackerNet(keras.Model):
@@ -59,7 +35,7 @@ class TrackerNet(keras.Model):
         self.softmax = layers.Softmax()
 
     def build(self, input_shape):
-        x = keras.Input(shape=input_shape[1:])
+        x: tf.Tensor = keras.Input(shape=input_shape[1:])  # type: ignore
         self.call(x)
         super().build(input_shape)
 

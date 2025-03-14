@@ -4,6 +4,7 @@ from logging import Logger
 import os
 from pathlib import Path
 from typing import Any, Generator, OrderedDict, Tuple
+import keras
 import numpy as np
 import tensorflow as tf
 from PIL import Image
@@ -12,7 +13,7 @@ from tiny_ball_detector.dataset.image_parser import ColorMode, ImageParser
 
 
 @dataclass(kw_only=True)
-class GameDataset:
+class ClipDataset:
     game: str
     clip: str
     clip_path: Path
@@ -22,7 +23,7 @@ class GameDataset:
         return tf.data.Dataset.from_tensor_slices(
             [
                 [str(path), str(path).replace("input", "output")]
-                for path in self.clip_path.glob("*.jpg")
+                for path in sorted(self.clip_path.glob("*.jpg"))
             ]
         )
 
@@ -116,31 +117,122 @@ class TrackNetDataset:
 
         im.save(f"{output_path}/{file_name_str}")
 
-    @property
-    def dataset(self) -> tf.data.Dataset:
+    def dataset(
+        self,
+        batch_size: int,
+        new_height: int,
+        new_width: int,
+    ) -> tf.data.Dataset:
         parser = ImageParser(image_size=(self.height, self.width))
         data = [
-            GameDataset(
-                game=clip_path.parts[-2],
-                clip=clip_path.parts[-1],
+            self._clip_dataset(
                 clip_path=clip_path,
+                batch_size=batch_size,
+                new_height=new_height,
+                new_width=new_width,
+                parser=parser,
             )
-            .dataset.map(
-                lambda x: (
-                    parser(x[0], color_mode=ColorMode.RGB),
-                    parser(x[1], color_mode=ColorMode.GRAYSCALE),
-                )
-            )
-            .batch(self.n_frames, drop_remainder=True)
-            .map(self.transpose_reshape)
             for clip_path in sorted(list(self.path.glob("input/*/Clip*/")))
         ]
 
         return functools.reduce(lambda x, y: x.concatenate(y), data)
 
+    def clip(
+        self,
+        game: int,
+        clip: int,
+        batch_size: int,
+        new_height: int,
+        new_width: int,
+    ) -> tf.data.Dataset:
+        clip_path = self.path / f"input/game{game}/Clip{clip}"
+        parser = ImageParser(image_size=(1080, 1920))
+
+        clip_dataset = ClipDataset(
+            game=clip_path.parts[-2],
+            clip=clip_path.parts[-1],
+            clip_path=clip_path,
+        )
+
+        print(clip_dataset)
+
+        return (
+            clip_dataset.dataset.map(
+                lambda x: (
+                    parser(x[0], color_mode=ColorMode.RGB),
+                    parser(x[0], color_mode=ColorMode.RGB),
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .batch(
+                self.n_frames, drop_remainder=True, num_parallel_calls=tf.data.AUTOTUNE
+            )
+            .map(self.transpose_reshape, num_parallel_calls=tf.data.AUTOTUNE)
+            .batch(batch_size, num_parallel_calls=tf.data.AUTOTUNE)
+            .map(
+                lambda images, labels: (
+                    keras.preprocessing.image.smart_resize(
+                        images, (new_height, new_width)
+                    ),
+                    keras.preprocessing.image.smart_resize(
+                        labels, (new_height, new_width)
+                    ),
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .prefetch(tf.data.AUTOTUNE)
+            .cache()
+        )
+
+    def _clip_dataset(
+        self,
+        clip_path: Path,
+        batch_size: int,
+        new_height: int,
+        new_width: int,
+        parser: ImageParser,
+    ) -> tf.data.Dataset:
+        clip_dataset = ClipDataset(
+            game=clip_path.parts[-2],
+            clip=clip_path.parts[-1],
+            clip_path=clip_path,
+        )
+
+        print(clip_dataset)
+
+        return (
+            clip_dataset.dataset.map(
+                lambda x: (
+                    parser(x[0], color_mode=ColorMode.RGB),
+                    parser(x[1], color_mode=ColorMode.GRAYSCALE),
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .batch(
+                self.n_frames, drop_remainder=True, num_parallel_calls=tf.data.AUTOTUNE
+            )
+            .map(self.transpose_reshape, num_parallel_calls=tf.data.AUTOTUNE)
+            .batch(batch_size, num_parallel_calls=tf.data.AUTOTUNE)
+            .map(
+                lambda images, labels: (
+                    keras.preprocessing.image.smart_resize(
+                        images, (new_height, new_width)
+                    ),
+                    keras.preprocessing.image.smart_resize(
+                        labels, (new_height, new_width)
+                    ),
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .prefetch(tf.data.AUTOTUNE)
+            .cache()
+        )
+
     def transpose_reshape(self, image, label):
         image_transposed = tf.transpose(image, perm=[1, 2, 0, 3])
-        image_final = tf.reshape(image_transposed, (self.height, self.width, 9))
+        image_final = tf.reshape(
+            image_transposed, (image_transposed.shape[0], image_transposed.shape[1], -1)
+        )
         return image_final, label[[-1]]
 
     def group_frames(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
